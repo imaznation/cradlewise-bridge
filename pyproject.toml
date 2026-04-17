@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cradlewise-bridge"
+version = "0.1.0"
+description = "Unofficial interoperability library for Cradlewise smart cribs: REST state, WebRTC video/audio via Janus gateway, continuous recording, audio spike detection."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["cradlewise", "webrtc", "janus", "baby-monitor", "home-automation", "interoperability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+    "pycradlewise>=0.3.0",
+    "aiortc>=1.6.0",
+    "aiohttp>=3.9.0",
+    "boto3>=1.28.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "imageio[ffmpeg]>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR-USERNAME/cradlewise-bridge"
+Issues = "https://github.com/YOUR-USERNAME/cradlewise-bridge/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

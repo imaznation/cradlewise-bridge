@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets — NEVER commit
+credentials.json
+*.credentials
+.env
+.env.*
+!.env.example
+
+# Runtime output — users' own recordings should never be committed
+snapshots/
+recordings/
+audio_snippets/
+*.mp4
+*.wav
+*.jpg
+*.png
+clips.db
+clips.db-*
+
+# OS
+.DS_Store
+Thumbs.db

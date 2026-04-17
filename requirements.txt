@@ -1,0 +1,7 @@
+pycradlewise>=0.3.0
+aiortc>=1.6.0
+aiohttp>=3.9.0
+boto3>=1.28.0
+numpy>=1.24.0
+Pillow>=10.0.0
+imageio[ffmpeg]>=2.31.0
