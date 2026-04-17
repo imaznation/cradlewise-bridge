@@ -1,5 +1,8 @@
 # cradlewise-bridge
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/imaznation)
+
 An unofficial interoperability library for [Cradlewise](https://cradlewise.com/)
 smart cribs. Uses your own Cradlewise credentials to subscribe to the live
 video and audio feed your crib already publishes to Cradlewise's cloud, so
@@ -190,6 +193,12 @@ Scope I'll decline:
   stack that makes Python WebRTC actually work.
 * [Janus Gateway](https://janus.conf.meetecho.com/) — the server side of the
   media pipeline (not affiliated with this project, just used by Cradlewise).
+
+## Support
+
+If this project helped you get more out of your Cradlewise, consider buying me a coffee!
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?logo=buy-me-a-coffee&style=for-the-badge)](https://buymeacoffee.com/imaznation)
 
 ## License
 
