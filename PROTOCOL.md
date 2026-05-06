@@ -283,10 +283,15 @@ frames under GC pressure or in long-running sessions. Always subscribe.
 
 ## 9. What we chose not to reverse-engineer
 
-* **Local MQTT control plane.** The crib exposes an mTLS MQTT interface
+* **Local MQTT *control* plane.** The crib exposes an mTLS MQTT interface
   that the mobile app uses for low-latency control (bouncing, music, 2-way
-  audio). Reading from it would be straightforward; *writing* to it is
-  explicitly out of scope because this library is read-only by design.
+  audio). Sending control commands is explicitly out of scope because this
+  library is read-only by design.
+
+  However, the same broker also carries the *subscriber-side video
+  signaling* — see §10. That path is a read-only "subscribe to a stream
+  the crib already publishes," consistent with this library's ethos, and
+  it bypasses the cloud entirely.
 * **Firmware OTA channel.** Not relevant to monitoring.
 * **In-app analytics endpoints.** Not relevant, and likely carry PII we
   have no business touching.
@@ -294,3 +299,170 @@ frames under GC pressure or in long-running sessions. Always subscribe.
 The read-only stance is both ethical (don't mess with a device that a
 real infant depends on) and practical (it keeps the blast radius of any
 bug in this library small).
+
+## 10. Local-mode (LAN) WebRTC signaling
+
+When the subscriber is on the same WiFi as the crib, the official mobile
+app skips the cloud Janus path entirely and exchanges WebRTC offers/
+answers with the crib directly over its local Greengrass MQTT broker. The
+``connection_mode: "local"`` field in the app's analytics POSTs is the
+giveaway; you'll never see a ``GET /cradles/{id}/videoRoom`` REST call
+fire when the app is on the same LAN as the crib.
+
+This is a substantially simpler path: there's no cloud Lambda gating,
+no per-session HMAC, no shared video-room infrastructure. Just MQTT to
+the crib's local broker, a Wowza-flavored signaling message exchange,
+and a direct LAN WebRTC peer connection.
+
+Reference implementation lives in ``cradlewise_bridge.local``
+(``LocalVideoRoomClient``).
+
+### 10.1 Transport
+
+Per-crib mTLS to the crib's Greengrass broker on port 8883:
+
+```
+host:    <crib LAN IP>            # e.g. 192.168.68.69
+port:    8883
+TLS:     mTLS, the same per-crib cert/key/CA you use for cloud IoT
+         (downloaded via /cradles/pairedUsers/v3 — see pycradlewise)
+client_id: <device_id>            # MUST equal the device_id on this cert.
+                                  # Anything else returns CONNACK rc=5
+                                  # "Not authorized" — the per-cert IoT
+                                  # policy gates iot:Connect on
+                                  # ${iot:Certificate.Subject.CommonName}.
+hostname check: skip              # cert CN doesn't match the LAN IP
+```
+
+The crib's local IP can be read from the cradle shadow at
+``state.reported.bluetooth.wifiStats.localIP``, or from the REST
+``GET /cradles/{cradle_id}/onlineStatus/v2`` response under
+``state_message.info.connectivity.localIP``.
+
+### 10.2 Topic + message envelope
+
+All signaling rides on a single topic:
+
+```
+/{cradleId}/room                        # both client → crib and crib → client
+```
+
+Every message is a JSON object roughly shaped like ``LocalWebRtcMessage`` in
+the Android source:
+
+```json
+{
+  "command":    "<getOffer|sendOffer|sendResponse>",
+  "direction":  "<play|publish>",
+  "streamInfo": {"applicationName": "live",
+                 "sessionId": "<unix-ms timestamp>",
+                 "streamName": "<requesting peer's deviceId>"},
+  "userData":   {"param1": "value1"},     // free-form; treat as opaque
+  "sdp":        {"type": "offer|answer", "sdp": "..."},   // when applicable
+  "ice":        {"candidate": "...", "sdpMid": "0", "sdpMLineIndex": 0}
+                                                  // ICE-only messages
+}
+```
+
+The signaling protocol is Wowza-style. Direction values mean:
+* ``"play"`` — subscriber side (client). We use this for both ``getOffer``
+  and ``sendResponse``.
+* ``"publish"`` — publisher side (the crib). The crib uses this when it
+  emits ``sendOffer``.
+
+### 10.3 Subscribe-side flow
+
+```
+client                                           crib
+  │   {command:"getOffer", direction:"play",      │
+  │    streamInfo:{...sessionId:S}, userData}     │
+  │ ────────────────────────────────────────────► │
+  │                                                │
+  │   {direction:"publish", command:"sendOffer",   │
+  │    sdp:{type:"offer", sdp:"<H264 sendonly>"},  │
+  │    streamInfo:{...sessionId:S}, userData}      │
+  │ ◄──────────────────────────────────────────── │
+  │                                                │
+  │   {command:"sendResponse", direction:"play",   │
+  │    sdp:{type:"answer", sdp:"<answer>"},        │
+  │    streamInfo:{...sessionId:S}, userData}      │
+  │ ────────────────────────────────────────────► │
+  │                                                │
+  │   {ice:{candidate:"...host..."}, streamInfo}   │  × 3 (1 UDP + 2 TCP)
+  │ ◄──────────────────────────────────────────── │
+  │                                                │
+  │   ... ICE checks → DTLS-SRTP → media ...       │
+```
+
+The crib's ``sendOffer`` arrives within ~150 ms of ``getOffer``. The
+``sessionId`` is echoed verbatim — use that to multiplex if you have
+multiple sessions in flight.
+
+### 10.4 The answer SDP must mirror the offer
+
+This is the trickiest part: the crib's libwebrtc-derived SDP parser is
+strict and silently drops aiortc's stock ``createAnswer`` output. The
+following differences matter, and we've narrowed each one down by
+diffing what the iOS app sends vs. what aiortc generates:
+
+| Attribute             | Cradle expects                  | aiortc generates    |
+|-----------------------|---------------------------------|---------------------|
+| Audio ``m=`` port     | ``0`` + ``a=bundle-only``       | non-zero, no bundle |
+| ``a=setup``           | ``passive`` or ``active``       | ``active`` (OK)     |
+| Fingerprint count     | exactly one (``sha-256``)       | three (256/384/512) |
+| OPUS rtpmap case      | ``OPUS``                        | ``opus``            |
+| Extra ``a=msid``, ``a=msid-semantic``, ``a=rtcp:9 IN IP4 ...`` | absent | present |
+
+The cleanest workaround is to build the answer by *mirroring* the offer
+verbatim, then surgically flipping the direction-related attributes
+(``sendonly`` → ``recvonly``, ``actpass`` → ``active``) and splicing in
+aiortc's actual DTLS material (ufrag, pwd, sha-256 fingerprint). The
+result mirrors the offer line-for-line, which is exactly what the
+crib's parser is happy with. ``_build_mirrored_answer`` in ``local.py``
+implements this.
+
+### 10.5 Answer must be trickle-shaped
+
+The cradle expects answers in trickle-ICE form: no ``a=candidate:`` lines
+inline, no ``a=end-of-candidates``. ICE candidates come over MQTT as
+separate ``ice`` messages.
+
+Send the answer first, then start trickling your own candidates as you
+gather them; the cradle starts trickling its candidates immediately after
+it accepts the answer (typically 3 candidates: 1 UDP host + 1 TCP active
++ 1 TCP passive, all on the cradle's LAN IP).
+
+### 10.6 Timing budget
+
+The cradle gives you about **3 seconds** between ``sendOffer`` and a
+valid ``sendResponse``. Miss it and the cradle removes you from
+``monitor.localPeers`` and you have to start over with a fresh
+``getOffer``. With aiortc this means setting
+``RTCConfiguration(iceServers=[])`` — STUN gathering with the default
+Google STUN server adds ~5 seconds and blows the budget.
+
+### 10.7 What ``monitor.localPeers`` tells you
+
+Independently useful: the crib's device shadow at
+``state.reported.monitor.localPeers`` is a real-time list of deviceIds
+currently subscribed to its WebRTC stream (locally OR via the cloud
+path). It updates within ~100 ms of any peer joining or leaving. This
+is the cleanest "is anyone watching this crib right now?" signal short
+of polling.
+
+### 10.8 Open issue: DTLS-SRTP handshake with aiortc
+
+Signaling via ``LocalVideoRoomClient`` succeeds end-to-end (the cradle
+keeps us in ``localPeers`` past its 3-second timeout, and ICE
+negotiation reaches ``completed``). The DTLS-SRTP handshake then fails
+silently. The cradle uses libwebrtc's DTLS implementation; aiortc uses
+``pyOpenSSL``-based DTLS, and there's at least one known interop quirk
+in this combination. The iOS app source filters cradle-issued ICE
+candidates down to TCP-only — but aiortc's TCP-ICE support is
+incomplete, so that workaround isn't reachable from this library.
+
+Resolving this likely requires switching the WebRTC stack
+(gstreamer ``webrtcbin``, a node ``wrtc`` bridge, or native
+``libwebrtc``) for the actual peer-connection layer. The signaling
+protocol described above is correct and reusable regardless of which
+WebRTC implementation handles the media layer.

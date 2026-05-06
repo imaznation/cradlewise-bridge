@@ -9,15 +9,17 @@ reverse-engineered wire-level details.
 """
 from .client import CradlewiseBridge, CribConfig
 from .janus import JanusVideoRoomClient
+from .local import LocalVideoRoomClient
 from .rest import VideoRoomCredentials, fetch_video_room
 from .audio import AudioSpikeDetector
 from .recorder import SegmentRecorder
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "CradlewiseBridge",
     "CribConfig",
     "JanusVideoRoomClient",
+    "LocalVideoRoomClient",
     "VideoRoomCredentials",
     "fetch_video_room",
     "AudioSpikeDetector",

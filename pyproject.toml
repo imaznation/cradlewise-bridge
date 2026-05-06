@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cradlewise-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial interoperability library for Cradlewise smart cribs: REST state, WebRTC video/audio via Janus gateway, continuous recording, audio spike detection."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,6 +29,7 @@ dependencies = [
     "numpy>=1.24.0",
     "Pillow>=10.0.0",
     "imageio[ffmpeg]>=2.31.0",
+    "paho-mqtt>=2.0.0",
 ]
 
 [project.optional-dependencies]
