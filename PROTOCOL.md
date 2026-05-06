@@ -529,15 +529,30 @@ payload type 97 for video, 96 for audio. Standard RFC 6184 packetization:
 
 Output an Annex-B stream and ffmpeg / PyAV decode it directly.
 
-### 10.12 Session lifetime
+### 10.12 Session lifetime — application-layer keepAlive required
 
-The crib closes the TCP connection 5–10 s after media starts flowing.
-Root cause hasn't been pinned down — most likely we're missing a
-periodic STUN consent-freshness check on a longer interval, or we're
-not sending the RTCP receiver reports the crib expects. For one-shot
-snapshot capture this is plenty of time (5+ keyframes typically arrive
-in the first second). For continuous recording, wrap the client in a
-reconnect loop with brief backoff.
+The crib drops the TCP media connection at exactly 15 s without an
+application-layer keepalive. **Neither STUN consent-freshness nor RTCP
+receiver reports satisfy this** — both transport-layer keepalives can
+be sent at high frequency and the crib still drops at 15 s.
+
+The right keepalive is a Wowza-style ``keepAlive`` command published on
+the same MQTT signaling topic as the original handshake:
+
+```json
+{
+  "direction": "play",
+  "command":   "keepAlive",
+  "streamInfo": {"applicationName": "live",
+                 "sessionId": "<same as getOffer>",
+                 "streamName": "<our deviceId>"},
+  "userData":   {"param1": "value1"}
+}
+```
+
+Source: ``LocalWebRtc.setLocalStreamKeepAlive`` in the APK. Send every
+5 s (the iOS app uses a similar interval). Verified: with this in
+place, sessions sustain for the full test window (60+ s with no drop).
 
 ### 10.13 Status — fully working
 

@@ -284,6 +284,9 @@ class LocalVideoRoomClient:
     _mqtt_inbox: asyncio.Queue | None = field(default=None, init=False)
     _tcp_transport: TCPDatagramTransport | None = field(default=None, init=False)
     _dtls: Any = field(default=None, init=False)
+    _keepalive_task: asyncio.Task | None = field(default=None, init=False)
+    _publisher_ssrc: int | None = field(default=None, init=False)
+    _highest_seq: int = field(default=0, init=False)
 
     def stop(self) -> None:
         self._stop = True
@@ -431,6 +434,14 @@ class LocalVideoRoomClient:
         async def my_handle_rtp(data: bytes, arrival_time_ms: int) -> None:
             self.stats.rtp_packets += 1
             self.stats.last_packet_time = time.monotonic()
+            # Cache publisher SSRC + sequence — needed for RTCP receiver reports
+            if len(data) >= 12:
+                seq = int.from_bytes(data[2:4], "big")
+                ssrc = int.from_bytes(data[8:12], "big")
+                if self._publisher_ssrc is None:
+                    self._publisher_ssrc = ssrc
+                if seq > self._highest_seq:
+                    self._highest_seq = seq
             annexb = depack.feed(data)
             if annexb:
                 self.stats.annexb_bytes += len(annexb)
@@ -457,6 +468,18 @@ class LocalVideoRoomClient:
             except Exception:
                 logger.exception("[%s] on_connected raised", self.cradle_id)
 
+        # Start session keepalive task: publishes a Wowza-style "keepAlive"
+        # message on the MQTT signaling topic every 5s. Without it the
+        # cradle drops the TCP media connection at exactly 15s. The format
+        # comes straight from the iOS app source (LocalWebRtc.kt
+        # setLocalStreamKeepAlive). STUN consent-freshness + RTCP RR alone
+        # do NOT satisfy the cradle — the keepalive is at the application
+        # signaling layer.
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(session_id),
+            name=f"cw-local-keepalive-{self.cradle_id[:8]}",
+        )
+
         # aiortc's __run task is reading from transport; just block until
         # something signals stop or DTLS closes.
         while not self._stop and dtls.state == "connected":
@@ -479,6 +502,42 @@ class LocalVideoRoomClient:
             if m:
                 return int(m.group(1))
         return None
+
+    async def _keepalive_loop(self, session_id: str) -> None:
+        """Publish ``{"command":"keepAlive"}`` on /{cradleId}/room every 5s.
+
+        The cradle drops the TCP media connection at ~15s without this. The
+        format is straight from the iOS app's
+        ``LocalWebRtc.setLocalStreamKeepAlive`` (Android source). It's an
+        application-layer signal — STUN consent-freshness and RTCP receiver
+        reports do NOT satisfy the cradle.
+        """
+        body = {
+            "direction": "play",
+            "command": "keepAlive",
+            "streamInfo": {
+                "applicationName": APPLICATION_NAME,
+                "sessionId": session_id,
+                "streamName": self.device_id,
+            },
+            "userData": {"param1": "value1"},
+        }
+        try:
+            tick = 0
+            while not self._stop:
+                await asyncio.sleep(5.0)
+                if self._stop:
+                    break
+                tick += 1
+                try:
+                    self._publish(body)
+                    logger.debug("[%s] keepAlive #%d", self.cradle_id, tick)
+                except Exception as e:
+                    logger.debug("[%s] keepAlive publish failed: %s",
+                                 self.cradle_id, e)
+                    return
+        except asyncio.CancelledError:
+            return
 
     async def _ice_check(self, transport: TCPDatagramTransport,
                          remote_ufrag: str, our_ufrag: str,
@@ -517,6 +576,13 @@ class LocalVideoRoomClient:
 
     async def _teardown(self) -> None:
         self.stats.connected = False
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._keepalive_task = None
         if self._dtls is not None:
             try:
                 await self._dtls.stop()
