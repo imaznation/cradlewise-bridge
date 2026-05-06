@@ -450,19 +450,99 @@ path). It updates within ~100 ms of any peer joining or leaving. This
 is the cleanest "is anyone watching this crib right now?" signal short
 of polling.
 
-### 10.8 Open issue: DTLS-SRTP handshake with aiortc
+### 10.8 Media transport: TCP-passive only (UDP DTLS is silently dropped)
 
-Signaling via ``LocalVideoRoomClient`` succeeds end-to-end (the cradle
-keeps us in ``localPeers`` past its 3-second timeout, and ICE
-negotiation reaches ``completed``). The DTLS-SRTP handshake then fails
-silently. The cradle uses libwebrtc's DTLS implementation; aiortc uses
-``pyOpenSSL``-based DTLS, and there's at least one known interop quirk
-in this combination. The iOS app source filters cradle-issued ICE
-candidates down to TCP-only — but aiortc's TCP-ICE support is
-incomplete, so that workaround isn't reachable from this library.
+The cradle advertises three ICE candidates on ``/{cradleId}/room``:
 
-Resolving this likely requires switching the WebRTC stack
-(gstreamer ``webrtcbin``, a node ``wrtc`` bridge, or native
-``libwebrtc``) for the actual peer-connection layer. The signaling
-protocol described above is correct and reusable regardless of which
-WebRTC implementation handles the media layer.
+```
+candidate:1 1 UDP    2015363327 <crib-ip> <port>      typ host
+candidate:2 1 TCP    1015021823 <crib-ip> 9           typ host tcptype active
+candidate:3 1 TCP    1010827519 <crib-ip> <port>      typ host tcptype passive
+```
+
+The UDP candidate is a red herring. The cradle's media path is **TCP only**;
+DTLS attempts on the UDP host candidate succeed at ICE level but the
+cradle drops them at DTLS handshake (pyOpenSSL surfaces this as
+``SSL.ZeroReturnError``). The iOS app source confirms this — its inbound
+ICE handler filters cradle candidates down to TCP-only:
+
+```kotlin
+if (StringsKt.contains$default(candidate, "TCP", ...)) {
+    gotCradlesIceCandidate(localWebRtcMessage)
+}
+```
+
+Use the **TCP-passive** candidate (we initiate the TCP connection to the
+crib's advertised port). RFC 4571 frames every "datagram" on the TCP
+connection: ``<2-byte BE length><payload>``. The same TCP connection
+carries ICE STUN, DTLS, and SRTP packets, demuxed by the first byte of
+each framed payload (per RFC 7983 — STUN: 0–3, DTLS: 20–63, SRTP/SRTCP:
+128–191).
+
+### 10.9 ICE on TCP — bidirectional STUN
+
+Both sides do connectivity checks. After we send our STUN binding request
+to the crib and get a response, the crib **also** sends us its own STUN
+binding requests, both during the DTLS handshake and periodically after.
+You must respond to those, or the crib drops the TCP connection within
+a few seconds. ``aiortc.RTCDtlsTransport`` has no STUN handling at all
+(its ``_recv_next`` ignores STUN packets) — the responder has to live
+in the transport layer, intercepting STUN packets before they reach
+aiortc.
+
+A binding response needs:
+* same ``transaction_id`` as the request
+* ``XOR-MAPPED-ADDRESS`` pointing at the cradle's address as we see it
+  (i.e. the TCP connection's remote endpoint)
+* ``MESSAGE-INTEGRITY`` HMAC-signed with **our** ICE password (the one
+  we put in the answer SDP — the cradle verifies the request against it)
+
+### 10.10 DTLS — must be 1.2
+
+The cradle responds to DTLS 1.0 ClientHellos with a fatal
+``handshake_failure(40)`` alert. Force pyOpenSSL to negotiate DTLS 1.2
+only:
+
+```python
+ctx = SSL.Context(SSL.DTLS_METHOD)
+ctx.set_min_proto_version(SSL.TLS1_2_VERSION)   # maps to DTLS 1.2 in DTLS context
+ctx.set_max_proto_version(SSL.TLS1_2_VERSION)
+ctx.set_cipher_list(b"DEFAULT:HIGH:!aNULL:!eNULL:!MD5:!RC4")
+```
+
+aiortc's stock cipher list (``ECDHE-ECDSA-*`` only) is also too narrow
+for the cradle's libwebrtc cipher set. Widening to ``DEFAULT:HIGH``
+covers the negotiated suite without security loss.
+
+### 10.11 H.264 RTP depacketization (RFC 6184)
+
+The cradle's video stream is H.264 Baseline @ Level 4.0, OPUS audio. RTP
+payload type 97 for video, 96 for audio. Standard RFC 6184 packetization:
+
+* NAL types 1–23: single NAL packet — emit ``00 00 00 01`` start code +
+  payload as Annex-B.
+* NAL type 28 (FU-A): fragmented unit. Reassemble by tracking start/end
+  bits, then emit start code + reconstructed NAL header + concatenated
+  fragments.
+* NAL type 24 (STAP-A): aggregation. Walk the embedded length-prefixed
+  NAL units and emit each with its own start code.
+
+Output an Annex-B stream and ffmpeg / PyAV decode it directly.
+
+### 10.12 Session lifetime
+
+The crib closes the TCP connection 5–10 s after media starts flowing.
+Root cause hasn't been pinned down — most likely we're missing a
+periodic STUN consent-freshness check on a longer interval, or we're
+not sending the RTCP receiver reports the crib expects. For one-shot
+snapshot capture this is plenty of time (5+ keyframes typically arrive
+in the first second). For continuous recording, wrap the client in a
+reconnect loop with brief backoff.
+
+### 10.13 Status — fully working
+
+``LocalVideoRoomClient.run()`` and ``capture_snapshot()`` produce
+decoded JPEG frames from the crib's live LAN stream, end-to-end. The
+``capture_snapshot()`` convenience function is the recommended entry
+point for "grab one frame on demand" use cases (e.g. attaching a frame
+to a security alert).
