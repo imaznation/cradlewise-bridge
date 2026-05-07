@@ -686,3 +686,194 @@ def _decode_first_jpeg(annexb: bytes) -> bytes:
         err = proc.stderr.decode("utf-8", errors="replace")[:500]
         raise ValueError(f"ffmpeg failed to decode H.264: {err}")
     return proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Continuous streaming — long-running connection with frame callbacks
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StreamStats:
+    """Snapshot of a continuous stream's state.
+
+    Pass-by-reference is intentional — callers can poll the same instance for
+    live status without us pushing updates.
+    """
+    connected: bool = False
+    frames_received: int = 0
+    frames_decoded: int = 0
+    last_frame_at: float = 0.0
+    reconnect_count: int = 0
+    last_error: str = ""
+
+
+FrameCallback = Callable[[Any, float], Awaitable[None]]
+"""Async callback receiving (PIL.Image, monotonic-timestamp). PIL is imported
+lazily inside capture_stream so users who only need snapshots aren't forced
+to install Pillow."""
+
+
+async def capture_stream(
+    *,
+    cradle_id: str,
+    device_id: str,
+    cradle_ip: str,
+    cert_path: str,
+    key_path: str,
+    ca_path: str,
+    on_frame: FrameCallback,
+    target_fps: float = 2.0,
+    initial_backoff: float = 2.0,
+    max_backoff: float = 60.0,
+    stats: StreamStats | None = None,
+) -> None:
+    """Maintain a continuous LAN video subscription, decoding H.264 to PIL frames.
+
+    Wraps :class:`LocalVideoRoomClient` with a reconnect loop and a streaming
+    PyAV decoder. Calls ``on_frame(pil_image, timestamp)`` at most ``target_fps``
+    times per second (extra frames are decoded but dropped). Returns only when
+    the surrounding task is cancelled — this is meant to run forever.
+
+    Why PyAV (and not the streaming-ffmpeg-subprocess approach used by
+    ``capture_snapshot``): for continuous streams we have full keyframes from
+    the start, so PyAV's in-process decoder is reliable. Subprocess + JPEG
+    boundary parsing would add latency and complicate frame timestamps.
+
+    Args:
+        cradle_id, device_id, cradle_ip, cert_path, key_path, ca_path:
+            Same as :func:`capture_snapshot`. mTLS material from
+            ``pycradlewise.refresh_device_certs``.
+        on_frame: Async callback. Exceptions are logged and swallowed so a
+            buggy consumer can't kill the stream.
+        target_fps: Throttle frame delivery to this rate. Set high (e.g. 30)
+            to deliver every decoded frame; set low (e.g. 2) to match a
+            ring-buffer's recorded fps and skip decoding work in between.
+            (Note: PyAV decodes every frame regardless — only the callback
+            invocation is rate-limited. Cradle output is ~10–15fps.)
+        initial_backoff, max_backoff: Reconnect schedule on disconnect.
+            Backoff resets on a successful frame.
+        stats: Optional shared :class:`StreamStats` for live monitoring.
+
+    Cancellation: cancel the surrounding task. ``LocalVideoRoomClient.stop()``
+    is called as part of cleanup.
+    """
+    import av
+    from PIL import Image  # noqa: F401  (PyAV uses it via .to_image)
+
+    if stats is None:
+        stats = StreamStats()
+    backoff = initial_backoff
+    min_callback_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+    last_callback_at = 0.0
+
+    while True:
+        # Per-iteration: build a fresh decoder + queue, run client, handle
+        # cleanup. The H.264 chunk queue decouples MQTT/SRTP receive from
+        # PyAV decode — without it, slow decoding back-pressures the SRTP
+        # reader and starts dropping packets.
+        chunk_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+        decoder = av.CodecContext.create("h264", "r")
+        client_alive = asyncio.Event()
+        client_alive.set()
+
+        async def on_h264(data: bytes) -> None:
+            stats.frames_received += 1
+            try:
+                chunk_queue.put_nowait(data)
+            except asyncio.QueueFull:
+                # Drop the oldest chunk to make room; backpressure indicates
+                # decode is genuinely behind, and dropping a partial NAL is
+                # better than blocking the SRTP reader.
+                try:
+                    chunk_queue.get_nowait()
+                    chunk_queue.put_nowait(data)
+                except asyncio.QueueEmpty:
+                    pass
+
+        async def on_connected() -> None:
+            stats.connected = True
+            stats.last_error = ""
+
+        client = LocalVideoRoomClient(
+            cradle_id=cradle_id, device_id=device_id, cradle_ip=cradle_ip,
+            cert_path=cert_path, key_path=key_path, ca_path=ca_path,
+            on_h264_data=on_h264, on_connected=on_connected,
+        )
+
+        async def decode_loop() -> None:
+            """Pull H.264 chunks → PyAV → throttled on_frame callback."""
+            nonlocal last_callback_at
+            while True:
+                chunk = await chunk_queue.get()
+                if chunk is None:  # shutdown sentinel
+                    return
+                try:
+                    packets = decoder.parse(chunk)
+                except Exception as e:
+                    logger.debug("[%s] H.264 parse error: %s", cradle_id, e)
+                    continue
+                for packet in packets:
+                    try:
+                        frames = decoder.decode(packet)
+                    except av.error.InvalidDataError:
+                        # Mid-stream join: missing earlier NALs. Skip until
+                        # we hit a keyframe and the decoder catches up.
+                        continue
+                    except Exception as e:
+                        logger.debug("[%s] H.264 decode error: %s", cradle_id, e)
+                        continue
+                    for frame in frames:
+                        stats.frames_decoded += 1
+                        now = time.monotonic()
+                        if min_callback_interval > 0 and (now - last_callback_at) < min_callback_interval:
+                            continue
+                        last_callback_at = now
+                        stats.last_frame_at = now
+                        # Reset backoff on the FIRST decoded frame of this
+                        # connection — proves we're actually streaming, not
+                        # just connected. Without this, a connection that
+                        # signals fine but never delivers frames would keep
+                        # backing off slowly.
+                        nonlocal backoff
+                        if backoff != initial_backoff:
+                            backoff = initial_backoff
+                        try:
+                            img = frame.to_image()
+                        except Exception:
+                            logger.debug("[%s] frame.to_image failed", cradle_id)
+                            continue
+                        try:
+                            await on_frame(img, now)
+                        except Exception:
+                            logger.exception("[%s] on_frame raised", cradle_id)
+
+        decoder_task = asyncio.create_task(decode_loop(), name=f"cw-stream-decode-{cradle_id[:8]}")
+        run_task = asyncio.create_task(client.run(), name=f"cw-stream-run-{cradle_id[:8]}")
+
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            client.stop()
+            await chunk_queue.put(None)
+            decoder_task.cancel()
+            with __import__("contextlib").suppress(asyncio.CancelledError, Exception):
+                await decoder_task
+            raise
+        except Exception as e:
+            stats.last_error = f"{type(e).__name__}: {e}"
+            logger.warning("[%s] stream connection failed: %s", cradle_id, e)
+        finally:
+            stats.connected = False
+            await chunk_queue.put(None)
+            decoder_task.cancel()
+            with __import__("contextlib").suppress(asyncio.CancelledError, Exception):
+                await decoder_task
+
+        stats.reconnect_count += 1
+        logger.info("[%s] reconnecting in %.1fs", cradle_id, backoff)
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            raise
+        backoff = min(backoff * 2, max_backoff)
