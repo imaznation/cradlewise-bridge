@@ -39,6 +39,7 @@ from aioice import stun
 from aiortc.rtcdtlstransport import (
     RTCCertificate, RTCDtlsTransport, RTCDtlsParameters, RTCDtlsFingerprint,
 )
+from aiortc.rtp import RtcpRrPacket, RtcpReceiverInfo, RtcpSdesPacket, RtcpSourceInfo
 from OpenSSL import SSL
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,14 @@ def _mirror_offer_as_answer(offer_sdp: str, ufrag: str, pwd: str, fp: str) -> st
     answer = answer.replace("a=sendonly", "a=recvonly")
     # Strip the offer's SSRC declarations — those describe the publisher.
     answer = re.sub(r"a=ssrc:\S+.*\r?\n", "", answer)
+
+    # Accept the audio bundle by changing m=audio port from 0 to the video port,
+    # and removing a=bundle-only. If port is left 0, the crib disables audio.
+    vport_match = re.search(r"m=video (\d+)", offer_sdp)
+    if vport_match:
+        vport = vport_match.group(1)
+        answer = re.sub(r"m=audio 0", f"m=audio {vport}", answer)
+    answer = re.sub(r"a=bundle-only\r?\n", "", answer)
     return answer
 
 
@@ -234,6 +243,7 @@ def _re_first(s: str, pattern: str) -> str | None:
 
 H264Callback = Callable[[bytes], Awaitable[None]]
 ConnectedCallback = Callable[[], Awaitable[None]]
+RtpPacketCallback = Callable[[int, bytes], Awaitable[None]]
 
 
 @dataclass
@@ -276,6 +286,7 @@ class LocalVideoRoomClient:
 
     on_h264_data: H264Callback | None = None
     on_connected: ConnectedCallback | None = None
+    on_rtp_packet: RtpPacketCallback | None = None
 
     stats: LocalConnectionStats = field(default_factory=LocalConnectionStats)
 
@@ -285,11 +296,34 @@ class LocalVideoRoomClient:
     _tcp_transport: TCPDatagramTransport | None = field(default=None, init=False)
     _dtls: Any = field(default=None, init=False)
     _keepalive_task: asyncio.Task | None = field(default=None, init=False)
+    _rtcp_task: asyncio.Task | None = field(default=None, init=False)
     _publisher_ssrc: int | None = field(default=None, init=False)
     _highest_seq: int = field(default=0, init=False)
+    _receiver_ssrc: int = field(default=0, init=False)
+    _last_seq: int | None = field(default=None, init=False)
+    _seq_cycle: int = field(default=0, init=False)
+    _audio_ssrc: int | None = field(default=None, init=False)
+    _audio_highest_seq: int = field(default=0, init=False)
+    _audio_last_seq: int | None = field(default=None, init=False)
+    _audio_seq_cycle: int = field(default=0, init=False)
 
     def stop(self) -> None:
         self._stop = True
+
+    def _parse_audio_ssrc(self, sdp: str) -> int | None:
+        """Extract the SSRC from the audio m= section of the SDP offer."""
+        in_audio = False
+        for line in sdp.split('\n'):
+            line = line.strip().rstrip('\r')
+            if line.startswith('m=audio'):
+                in_audio = True
+            elif line.startswith('m=') and not line.startswith('m=audio'):
+                in_audio = False
+            if in_audio:
+                m = re.match(r'a=ssrc:(\d+)(?:\s|$)', line)
+                if m:
+                    return int(m.group(1))
+        return None
 
     async def run(self) -> None:
         """Connect, negotiate, stream H.264 until the cradle closes the session."""
@@ -405,6 +439,11 @@ class LocalVideoRoomClient:
         if not (remote_ufrag and remote_pwd and remote_fp):
             raise ConnectionError("offer SDP missing ICE/DTLS credentials")
 
+        audio_ssrc = self._parse_audio_ssrc(offer_sdp)
+        if audio_ssrc is not None:
+            logger.info("[%s] Parsed audio SSRC from SDP offer: %d", self.cradle_id, audio_ssrc)
+            self._audio_ssrc = audio_ssrc
+
         # Open TCP, do ICE STUN check (controlled side)
         tx = TCPDatagramTransport(self.cradle_ip, tcp_passive_port, our_pwd=our_pwd)
         self._tcp_transport = tx
@@ -434,22 +473,60 @@ class LocalVideoRoomClient:
         async def my_handle_rtp(data: bytes, arrival_time_ms: int) -> None:
             self.stats.rtp_packets += 1
             self.stats.last_packet_time = time.monotonic()
+            payload_type = data[1] & 0x7F
+
             # Cache publisher SSRC + sequence — needed for RTCP receiver reports
             if len(data) >= 12:
                 seq = int.from_bytes(data[2:4], "big")
                 ssrc = int.from_bytes(data[8:12], "big")
-                if self._publisher_ssrc is None:
-                    self._publisher_ssrc = ssrc
-                if seq > self._highest_seq:
-                    self._highest_seq = seq
-            annexb = depack.feed(data)
-            if annexb:
-                self.stats.annexb_bytes += len(annexb)
-                if self.on_h264_data:
-                    try:
-                        await self.on_h264_data(annexb)
-                    except Exception:
-                        logger.exception("[%s] on_h264_data raised", self.cradle_id)
+                if payload_type == 97:
+                    if self._publisher_ssrc is None:
+                        self._publisher_ssrc = ssrc
+                    if self._last_seq is None:
+                        self._last_seq = seq
+                        self._seq_cycle = 0
+                    else:
+                        diff = seq - self._last_seq
+                        if diff < -32768:
+                            self._seq_cycle += 1
+                        elif diff > 32768:
+                            # Out of order packet from previous cycle
+                            pass
+                        self._last_seq = seq
+                    extended_seq = (self._seq_cycle << 16) + seq
+                    if extended_seq > self._highest_seq:
+                        self._highest_seq = extended_seq
+                elif payload_type == 96:
+                    if self._audio_last_seq is None:
+                        self._audio_last_seq = seq
+                        self._audio_seq_cycle = 0
+                    else:
+                        diff = seq - self._audio_last_seq
+                        if diff < -32768:
+                            self._audio_seq_cycle += 1
+                        elif diff > 32768:
+                            # Out of order packet from previous cycle
+                            pass
+                        self._audio_last_seq = seq
+                    extended = (self._audio_seq_cycle << 16) + seq
+                    if extended > self._audio_highest_seq:
+                        self._audio_highest_seq = extended
+
+            if self.on_rtp_packet:
+                try:
+                    await self.on_rtp_packet(payload_type, data)
+                except Exception:
+                    logger.exception("[%s] on_rtp_packet raised", self.cradle_id)
+
+            if payload_type == 97:
+                annexb = depack.feed(data)
+                if annexb:
+                    self.stats.annexb_bytes += len(annexb)
+                    if self.on_h264_data:
+                        try:
+                            await self.on_h264_data(annexb)
+                        except Exception:
+                            logger.exception("[%s] on_h264_data raised", self.cradle_id)
 
         dtls._handle_rtp_data = my_handle_rtp
 
@@ -460,6 +537,14 @@ class LocalVideoRoomClient:
         await dtls.start(remote_params)
         if dtls.state != "connected":
             raise ConnectionError(f"DTLS handshake failed (state={dtls.state})")
+
+        self._receiver_ssrc = secrets.randbits(32)
+        self._last_seq = None
+        self._seq_cycle = 0
+        self._highest_seq = 0
+        self._audio_last_seq = None
+        self._audio_seq_cycle = 0
+        self._audio_highest_seq = 0
 
         self.stats.connected = True
         if self.on_connected:
@@ -480,9 +565,31 @@ class LocalVideoRoomClient:
             name=f"cw-local-keepalive-{self.cradle_id[:8]}",
         )
 
+        # Start periodic RTCP Receiver Reports task (every 5s) to satisfy the WebRTC publisher
+        self._rtcp_task = asyncio.create_task(
+            self._rtcp_loop(),
+            name=f"cw-local-rtcp-{self.cradle_id[:8]}",
+        )
+
         # aiortc's __run task is reading from transport; just block until
         # something signals stop or DTLS closes.
         while not self._stop and dtls.state == "connected":
+            if self._keepalive_task and self._keepalive_task.done():
+                try:
+                    self._keepalive_task.result()
+                except Exception as e:
+                    logger.warning("[%s] Keepalive task failed: %s", self.cradle_id, e)
+                else:
+                    logger.warning("[%s] Keepalive task terminated unexpectedly", self.cradle_id)
+                break
+            if self._rtcp_task and self._rtcp_task.done():
+                try:
+                    self._rtcp_task.result()
+                except Exception as e:
+                    logger.warning("[%s] RTCP task failed: %s", self.cradle_id, e)
+                else:
+                    logger.warning("[%s] RTCP task terminated unexpectedly", self.cradle_id)
+                break
             await asyncio.sleep(0.5)
 
     async def _wait_tcp_passive(self, *, timeout: float) -> int | None:
@@ -539,6 +646,67 @@ class LocalVideoRoomClient:
         except asyncio.CancelledError:
             return
 
+    async def _rtcp_loop(self) -> None:
+        """Periodically send RTCP Receiver Reports to the publisher (the crib).
+
+        Without RTCP Receiver Reports, standard WebRTC publishers (like the crib)
+        may assume the client is gone and close the media socket after ~30-55 seconds.
+        """
+        try:
+            tick = 0
+            while not self._stop:
+                if self._dtls:
+                    tick += 1
+                    reports = []
+                    
+                    # Video SSRC report (from incoming RTP)
+                    if self._publisher_ssrc is not None:
+                        reports.append(RtcpReceiverInfo(
+                            ssrc=self._publisher_ssrc,
+                            fraction_lost=0,
+                            packets_lost=0,
+                            highest_sequence=self._highest_seq,
+                            jitter=0,
+                            lsr=0,
+                            dlsr=0,
+                        ))
+                    
+                    # Audio SSRC report (from SDP offer - pre-seeded)
+                    if self._audio_ssrc is not None:
+                        reports.append(RtcpReceiverInfo(
+                            ssrc=self._audio_ssrc,
+                            fraction_lost=0,
+                            packets_lost=0,
+                            highest_sequence=self._audio_highest_seq,
+                            jitter=0,
+                            lsr=0,
+                            dlsr=0,
+                        ))
+                    
+                    if reports:
+                        rr_packet = RtcpRrPacket(
+                            ssrc=self._receiver_ssrc,
+                            reports=reports
+                        )
+                        sdes_packet = RtcpSdesPacket(
+                            chunks=[
+                                RtcpSourceInfo(
+                                    ssrc=self._receiver_ssrc,
+                                    items=[(1, b"cradlewise-bridge")]
+                                )
+                            ]
+                        )
+                        try:
+                            await self._dtls._send_rtp(bytes(rr_packet) + bytes(sdes_packet))
+                            logger.info("[%s] sent compound RTCP RR+SDES #%d for %d SSRCs",
+                                         self.cradle_id, tick, len(reports))
+                        except Exception as e:
+                            logger.warning("[%s] Failed to send RTCP RR: %s",
+                                           self.cradle_id, e)
+                await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            return
+
     async def _ice_check(self, transport: TCPDatagramTransport,
                          remote_ufrag: str, our_ufrag: str,
                          remote_pwd: str) -> None:
@@ -583,6 +751,13 @@ class LocalVideoRoomClient:
             except (asyncio.CancelledError, Exception):
                 pass
             self._keepalive_task = None
+        if self._rtcp_task is not None:
+            self._rtcp_task.cancel()
+            try:
+                await self._rtcp_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._rtcp_task = None
         if self._dtls is not None:
             try:
                 await self._dtls.stop()
