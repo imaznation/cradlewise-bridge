@@ -48,6 +48,28 @@ APPLICATION_NAME = "live"
 DTLS1_2_VERSION = 0xFEFD  # OpenSSL DTLS 1.2 wire version
 H264_START_CODE = b"\x00\x00\x00\x01"
 
+# FFmpeg's bitstream parsers deliberately read up to AV_INPUT_BUFFER_PADDING_SIZE
+# bytes past the end of the input they are handed — ff_combine_frame() copies
+# ``next + AV_INPUT_BUFFER_PADDING_SIZE`` bytes out of the caller's buffer — so
+# callers must supply that many readable bytes of slack. PyAV's
+# CodecContext.parse() forwards the bare PyObject_GetBuffer pointer to
+# av_parser_parse2 unchanged, and a plain ``bytes`` has no such slack. The
+# over-read usually lands in neighbouring heap and goes unnoticed; when a chunk
+# happens to end at the tail of a mapped region it segfaults the interpreter.
+AV_INPUT_BUFFER_PADDING_SIZE = 64
+
+
+def _padded(chunk: bytes) -> memoryview:
+    """Wrap ``chunk`` so FFmpeg's parser can safely over-read past its end.
+
+    The returned view reports the true chunk length — the parser must not treat
+    the padding as stream data — but is backed by a zero-filled allocation with
+    AV_INPUT_BUFFER_PADDING_SIZE readable bytes after it.
+    """
+    backing = bytearray(len(chunk) + AV_INPUT_BUFFER_PADDING_SIZE)
+    backing[: len(chunk)] = chunk
+    return memoryview(backing)[: len(chunk)]
+
 
 # ---------------------------------------------------------------------------
 # Custom RFC 4571 framed TCP transport — satisfies aiortc's RTCIceTransport
@@ -809,7 +831,7 @@ async def capture_stream(
                 if chunk is None:  # shutdown sentinel
                     return
                 try:
-                    packets = decoder.parse(chunk)
+                    packets = decoder.parse(_padded(chunk))
                 except Exception as e:
                     logger.debug("[%s] H.264 parse error: %s", cradle_id, e)
                     continue
