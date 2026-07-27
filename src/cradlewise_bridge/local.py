@@ -24,6 +24,7 @@ See ``PROTOCOL.md §10 — Local mode (LAN signaling)`` for the wire format.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import re
@@ -735,6 +736,30 @@ FrameCallback = Callable[[Any, float], Awaitable[None]]
 lazily inside capture_stream so users who only need snapshots aren't forced
 to install Pillow."""
 
+WakeCallback = Callable[[], Awaitable[None]]
+"""Async callback invoked when the cradle refuses the LAN connection, i.e. it
+has stopped publishing its local video room. See ``on_publisher_absent``."""
+
+
+def _is_publisher_absent(exc: BaseException) -> bool:
+    """True if ``exc`` means the cradle is not publishing its local video room.
+
+    A cradle that has gone idle (no Cradlewise app session for a while) tears
+    down its local video room and nothing listens on the LAN port, so the TCP
+    connect is refused outright. That is a distinct condition from a transient
+    network fault: it will not recover on its own no matter how long we back
+    off, because the cradle only republishes when the cloud asks it to.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ConnectionRefusedError):
+            return True
+        if getattr(exc, "errno", None) == errno.ECONNREFUSED:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 async def capture_stream(
     *,
@@ -749,6 +774,7 @@ async def capture_stream(
     initial_backoff: float = 2.0,
     max_backoff: float = 60.0,
     stats: StreamStats | None = None,
+    on_publisher_absent: WakeCallback | None = None,
 ) -> None:
     """Maintain a continuous LAN video subscription, decoding H.264 to PIL frames.
 
@@ -776,6 +802,14 @@ async def capture_stream(
         initial_backoff, max_backoff: Reconnect schedule on disconnect.
             Backoff resets on a successful frame.
         stats: Optional shared :class:`StreamStats` for live monitoring.
+        on_publisher_absent: Optional async hook invoked when the cradle
+            refuses the LAN connection, meaning it has stopped publishing its
+            local video room and will not come back on its own. Use it to ask
+            the cloud to republish (see :func:`cradlewise_bridge.rest
+            .fetch_video_room`); the retry after it runs picks the stream back
+            up. Called at most once per reconnect attempt, so rate-limit inside
+            the hook if it talks to a cloud API. Exceptions are logged and
+            swallowed — a failing wake must not kill the stream loop.
 
     Cancellation: cancel the surrounding task. ``LocalVideoRoomClient.stop()``
     is called as part of cleanup.
@@ -873,6 +907,7 @@ async def capture_stream(
         decoder_task = asyncio.create_task(decode_loop(), name=f"cw-stream-decode-{cradle_id[:8]}")
         run_task = asyncio.create_task(client.run(), name=f"cw-stream-run-{cradle_id[:8]}")
 
+        publisher_absent = False
         try:
             await run_task
         except asyncio.CancelledError:
@@ -884,6 +919,7 @@ async def capture_stream(
             raise
         except Exception as e:
             stats.last_error = f"{type(e).__name__}: {e}"
+            publisher_absent = _is_publisher_absent(e)
             logger.warning("[%s] stream connection failed: %s", cradle_id, e)
         finally:
             stats.connected = False
@@ -893,6 +929,21 @@ async def capture_stream(
                 await decoder_task
 
         stats.reconnect_count += 1
+
+        # A refused connection means the cradle tore down its local video room;
+        # retrying the same LAN port forever cannot fix that. Give the caller a
+        # chance to ask the cloud to republish before we back off again.
+        if publisher_absent and on_publisher_absent is not None:
+            # The hook may throttle or no-op; it logs its own outcome. Don't
+            # claim a wake was requested when we only offered the chance.
+            logger.info("[%s] cradle not publishing — invoking wake hook", cradle_id)
+            try:
+                await on_publisher_absent()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[%s] publisher wake failed", cradle_id)
+
         logger.info("[%s] reconnecting in %.1fs", cradle_id, backoff)
         try:
             await asyncio.sleep(backoff)
