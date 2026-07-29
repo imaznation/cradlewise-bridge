@@ -160,6 +160,91 @@ async def test_hook_failure_does_not_kill_stream_loop(monkeypatch):
     assert still_running, "a raising wake hook killed the stream loop"
 
 
+# --- audio (Opus) delivery --------------------------------------------------
+
+class _RtpCapturingClient:
+    """Captures the on_rtp_packet callback capture_stream installs, so tests
+    can feed packets without a live cradle."""
+
+    captured = {}
+
+    def __init__(self, **kwargs):
+        _RtpCapturingClient.captured["on_rtp"] = kwargs.get("on_rtp_packet")
+
+    async def run(self):
+        await asyncio.sleep(3600)
+
+    def stop(self):
+        pass
+
+
+async def _with_capture_stream(monkeypatch, on_audio):
+    monkeypatch.setattr(local, "LocalVideoRoomClient", _RtpCapturingClient)
+    task = asyncio.create_task(local.capture_stream(
+        cradle_id="c", device_id="d", cradle_ip="127.0.0.1",
+        cert_path="/x", key_path="/x", ca_path="/x",
+        on_frame=lambda img, ts: asyncio.sleep(0),
+        on_audio=on_audio,
+    ))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if _RtpCapturingClient.captured.get("on_rtp"):
+            break
+    return task, _RtpCapturingClient.captured.get("on_rtp")
+
+
+def _rtp(payload_type, payload=b"\x00" * 40, seq=1):
+    """Minimal 12-byte RTP header + payload."""
+    return (bytes([0x80, payload_type & 0x7F])
+            + seq.to_bytes(2, "big")
+            + (0).to_bytes(4, "big")      # timestamp
+            + (12345).to_bytes(4, "big")  # ssrc
+            + payload)
+
+
+@pytest.mark.asyncio
+async def test_video_payload_does_not_reach_audio_callback(monkeypatch):
+    got = []
+    task, on_rtp = await _with_capture_stream(monkeypatch, lambda f, ts: got.append(f))
+    assert on_rtp is not None, "capture_stream did not install on_rtp_packet"
+    await on_rtp(local.VIDEO_PAYLOAD_TYPE, _rtp(local.VIDEO_PAYLOAD_TYPE))
+    assert not got, "video RTP was routed to the audio decoder"
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, Exception)):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_malformed_audio_packet_is_swallowed(monkeypatch):
+    """A corrupt packet must not kill the stream."""
+    got = []
+    task, on_rtp = await _with_capture_stream(monkeypatch, lambda f, ts: got.append(f))
+    await on_rtp(local.AUDIO_PAYLOAD_TYPE, b"\x01\x02")        # too short to parse
+    await on_rtp(local.AUDIO_PAYLOAD_TYPE, _rtp(local.AUDIO_PAYLOAD_TYPE, b""))  # empty
+    await on_rtp(local.AUDIO_PAYLOAD_TYPE, _rtp(local.AUDIO_PAYLOAD_TYPE, b"\xff" * 8))  # junk
+    assert not got
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, Exception)):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_no_rtp_hook_installed_without_on_audio(monkeypatch):
+    """Callers that don't want audio pay no per-packet cost."""
+    _RtpCapturingClient.captured.clear()
+    monkeypatch.setattr(local, "LocalVideoRoomClient", _RtpCapturingClient)
+    task = asyncio.create_task(local.capture_stream(
+        cradle_id="c", device_id="d", cradle_ip="127.0.0.1",
+        cert_path="/x", key_path="/x", ca_path="/x",
+        on_frame=lambda img, ts: asyncio.sleep(0),
+    ))
+    await asyncio.sleep(0.2)
+    assert _RtpCapturingClient.captured.get("on_rtp") is None
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, Exception)):
+        await task
+
+
 @pytest.mark.asyncio
 async def test_absent_hook_is_optional(monkeypatch):
     """Omitting the hook must behave exactly as before."""

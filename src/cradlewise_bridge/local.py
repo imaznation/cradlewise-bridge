@@ -40,7 +40,9 @@ from aioice import stun
 from aiortc.rtcdtlstransport import (
     RTCCertificate, RTCDtlsTransport, RTCDtlsParameters, RTCDtlsFingerprint,
 )
-from aiortc.rtp import RtcpRrPacket, RtcpReceiverInfo, RtcpSdesPacket, RtcpSourceInfo
+from aiortc.rtp import (
+    RtcpRrPacket, RtcpReceiverInfo, RtcpSdesPacket, RtcpSourceInfo, RtpPacket,
+)
 from OpenSSL import SSL
 
 logger = logging.getLogger(__name__)
@@ -917,6 +919,14 @@ WakeCallback = Callable[[], Awaitable[None]]
 """Async callback invoked when the cradle refuses the LAN connection, i.e. it
 has stopped publishing its local video room. See ``on_publisher_absent``."""
 
+AudioCallback = Callable[[Any, float], Awaitable[None]]
+"""Async callback receiving (av.AudioFrame, monotonic-timestamp). PyAV is
+imported lazily inside capture_stream, same as PIL."""
+
+# RTP payload types the cradle publishes, per the SDP offer's a=rtpmap lines.
+VIDEO_PAYLOAD_TYPE = 97  # H264/90000
+AUDIO_PAYLOAD_TYPE = 96  # OPUS/48000/2
+
 
 def _is_publisher_absent(exc: BaseException) -> bool:
     """True if ``exc`` means the cradle is not publishing its local video room.
@@ -952,6 +962,7 @@ async def capture_stream(
     max_backoff: float = 60.0,
     stats: StreamStats | None = None,
     on_publisher_absent: WakeCallback | None = None,
+    on_audio: AudioCallback | None = None,
 ) -> None:
     """Maintain a continuous LAN video subscription, decoding H.264 to PIL frames.
 
@@ -987,6 +998,13 @@ async def capture_stream(
             up. Called at most once per reconnect attempt, so rate-limit inside
             the hook if it talks to a cloud API. Exceptions are logged and
             swallowed — a failing wake must not kill the stream loop.
+        on_audio: Optional async callback receiving decoded
+            ``(av.AudioFrame, timestamp)``. Opus is decoded here for the same
+            reason H.264 is: consumers want media, not RTP. Delivering
+            AudioFrame rather than raw samples means a consumer that already
+            handles the cloud path's aiortc frames can reuse that code
+            unchanged. Not rate-limited — audio is cheap and gaps matter for
+            level detection. Exceptions are logged and swallowed.
 
     Cancellation: cancel the surrounding task. ``LocalVideoRoomClient.stop()``
     is called as part of cleanup.
@@ -1028,9 +1046,31 @@ async def capture_stream(
             stats.connected = True
             stats.last_error = ""
 
+        # Opus decoder, rebuilt per connection alongside the H.264 one so a
+        # reconnect never resumes against stale decoder state.
+        audio_decoder = av.CodecContext.create("opus", "r") if on_audio else None
+
+        async def on_rtp(payload_type: int, data: bytes) -> None:
+            if audio_decoder is None or payload_type != AUDIO_PAYLOAD_TYPE:
+                return
+            try:
+                payload = RtpPacket.parse(data).payload
+            except Exception:
+                return  # malformed packet; nothing to recover
+            if not payload:
+                return
+            try:
+                # av.Packet allocates its own padded buffer, so unlike
+                # CodecContext.parse() this needs no _padded() wrapper.
+                for frame in audio_decoder.decode(av.Packet(payload)):
+                    await on_audio(frame, time.monotonic())
+            except Exception:
+                logger.debug("[%s] opus decode failed", cradle_id, exc_info=True)
+
         client = LocalVideoRoomClient(
             cradle_id=cradle_id, device_id=device_id, cradle_ip=cradle_ip,
             cert_path=cert_path, key_path=key_path, ca_path=ca_path,
+            on_rtp_packet=on_rtp if on_audio else None,
             on_h264_data=on_h264, on_connected=on_connected,
         )
 
