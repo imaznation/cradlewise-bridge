@@ -923,6 +923,10 @@ AudioCallback = Callable[[Any, float], Awaitable[None]]
 """Async callback receiving (av.AudioFrame, monotonic-timestamp). PyAV is
 imported lazily inside capture_stream, same as PIL."""
 
+VideoFrameCallback = Callable[[Any, float], Awaitable[None]]
+"""Async callback receiving (av.VideoFrame, monotonic-timestamp) at the native
+frame rate, unaffected by ``target_fps``. See ``on_video_frame``."""
+
 # RTP payload types the cradle publishes, per the SDP offer's a=rtpmap lines.
 VIDEO_PAYLOAD_TYPE = 97  # H264/90000
 AUDIO_PAYLOAD_TYPE = 96  # OPUS/48000/2
@@ -963,6 +967,7 @@ async def capture_stream(
     stats: StreamStats | None = None,
     on_publisher_absent: WakeCallback | None = None,
     on_audio: AudioCallback | None = None,
+    on_video_frame: VideoFrameCallback | None = None,
 ) -> None:
     """Maintain a continuous LAN video subscription, decoding H.264 to PIL frames.
 
@@ -1005,6 +1010,14 @@ async def capture_stream(
             handles the cloud path's aiortc frames can reuse that code
             unchanged. Not rate-limited — audio is cheap and gaps matter for
             level detection. Exceptions are logged and swallowed.
+        on_video_frame: Optional async callback receiving the decoded
+            ``(av.VideoFrame, timestamp)`` at the **native** frame rate,
+            deliberately not subject to ``target_fps``. Use it for anything
+            that needs every frame or the untouched frame — a recorder, for
+            instance, where routing through ``on_frame`` would mean a
+            YUV→RGB→YUV round trip. ``on_frame`` stays decimated for cheap
+            consumers like a snapshot ring buffer, so the two can coexist.
+            Exceptions are logged and swallowed.
 
     Cancellation: cancel the surrounding task. ``LocalVideoRoomClient.stop()``
     is called as part of cleanup.
@@ -1099,6 +1112,20 @@ async def capture_stream(
                     for frame in frames:
                         stats.frames_decoded += 1
                         now = time.monotonic()
+
+                        # Native-rate consumers get every decoded frame, before
+                        # the target_fps decimation below. A recorder needs the
+                        # full frame rate and the untouched VideoFrame -- going
+                        # via the PIL callback would mean YUV->RGB->YUV, which
+                        # costs quality and CPU for no reason.
+                        if on_video_frame is not None:
+                            try:
+                                await on_video_frame(frame, now)
+                            except Exception:
+                                logger.exception(
+                                    "[%s] on_video_frame raised", cradle_id,
+                                )
+
                         if min_callback_interval > 0 and (now - last_callback_at) < min_callback_interval:
                             continue
                         last_callback_at = now
